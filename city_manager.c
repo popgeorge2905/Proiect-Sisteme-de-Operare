@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <signal.h>
 
+// Structura principala - am pus time_t ca sa avem timestamp real
 typedef struct {
     int    id;
     char   inspector[64];
@@ -24,6 +25,7 @@ typedef struct {
 char rol_curent[32] = "";
 char user_curent[64] = "";
 
+// Functie utilitara ca sa transformam bitii de permisiuni in format tip ls -l
 void permisiuni_in_string(mode_t mode, char *str) {
     strcpy(str, "---------");
     if (mode & S_IRUSR) str[0] = 'r';
@@ -37,6 +39,8 @@ void permisiuni_in_string(mode_t mode, char *str) {
     if (mode & S_IXOTH) str[8] = 'x';
 }
 
+// Aici scriem log-ul doar daca suntem manageri. 
+// Important: folosim O_APPEND ca sa nu stergem ce a scris altcineva inainte.
 void scrie_in_log(const char *district, const char *actiune) {
     if (strcmp(rol_curent, "manager") != 0) return; 
 
@@ -53,15 +57,19 @@ void scrie_in_log(const char *district, const char *actiune) {
     close(fd);
 }
 
+// Functia asta se asigura ca folderele si link-urile exista inainte de orice operatie.
+// Am pus chmod imediat dupa creare ca sa fim siguri de permisiuni.
 void pregateste_district(const char *district) {
     struct stat st;
     char cale[256];
     
+    // Daca folderul nu exista, il facem noi.
     if (stat(district, &st) < 0) {
         mkdir(district, 0750);
         chmod(district, 0750);
     }
 
+    // Config-ul are threshold=1 default.
     snprintf(cale, sizeof(cale), "%s/district.cfg", district);
     if (stat(cale, &st) < 0) {
         int fd = open(cale, O_WRONLY | O_CREAT, 0640);
@@ -72,12 +80,15 @@ void pregateste_district(const char *district) {
         }
     }
 
+    // Log-ul trebuie sa fie acolo mereu.
     snprintf(cale, sizeof(cale), "%s/logged_district", district);
     if (stat(cale, &st) < 0) {
         int fd = open(cale, O_WRONLY | O_CREAT, 0644);
         if (fd >= 0) { close(fd); chmod(cale, 0644); }
     }
 
+    // Link simbolic tip 'active_reports-nume'. 
+    // Am folosit lstat ca sa verificam daca link-ul exista deja.
     char nume_link[256], tinta[256];
     snprintf(nume_link, sizeof(nume_link), "active_reports-%s", district);
     snprintf(tinta, sizeof(tinta), "%s/reports.dat", district);
@@ -87,6 +98,7 @@ void pregateste_district(const char *district) {
     }
 }
 
+// Parser simplu pentru filtre. Format cerut: camp:operator:valoare
 int extrage_conditie(const char *input, char *camp, char *op, char *valoare) {
     if (sscanf(input, "%31[^:]:%3[^:]:%63s", camp, op, valoare) == 3) {
         return 1;
@@ -94,6 +106,8 @@ int extrage_conditie(const char *input, char *camp, char *op, char *valoare) {
     return 0;
 }
 
+// Aici facem comparatia propriu-zisa pentru filtru.
+// Am bagat atoi() aici pentru ca severitatea e int in structura, nu string.
 int verifica_raport(Report *rap, const char *camp, const char *op, const char *val) {
     if (strcmp(camp, "severity") == 0) {
         int valoare_int = atoi(val); 
@@ -107,7 +121,7 @@ int verifica_raport(Report *rap, const char *camp, const char *op, const char *v
     return 0;
 }
 
-// --- Functiile cu comenzi ---
+// Operatiile cerute in Phase 1 si 2
 
 void adauga_raport(const char *district) {
     pregateste_district(district);
@@ -116,10 +130,11 @@ void adauga_raport(const char *district) {
     snprintf(cale_fisier, sizeof(cale_fisier), "%s/reports.dat", district);
 
     Report rap;
-    rap.id = (int)time(NULL);
+    rap.id = (int)time(NULL); // Folosim timpul ca ID unic (aproximativ)
     rap.timestamp = time(NULL);
     strncpy(rap.inspector, user_curent, 63);
     
+    // Citim datele de la tastatura.
     printf("Latitude: "); scanf("%lf", &rap.latitude);
     printf("Longitude: "); scanf("%lf", &rap.longitude);
     printf("Category: "); scanf("%31s", rap.category);
@@ -132,7 +147,8 @@ void adauga_raport(const char *district) {
         close(fd);
         chmod(cale_fisier, 0664); 
 
-        // Partea de notificare a procesului monitor (Phase 2)
+        // LOGICA DE SEMNALE (Phase 2):
+        // Cautam PID-ul monitorului in fisier. Daca nu e acolo, ignoram.
         int monitor_notificat = 0;
         int fd_pid = open(".monitor_pid", O_RDONLY);
         
@@ -143,37 +159,40 @@ void adauga_raport(const char *district) {
             
             if (bytes_read > 0) {
                 int pid_monitor = atoi(buffer_pid);
+                // Trimitem SIGUSR1 daca procesul exista.
                 if (pid_monitor > 0 && kill(pid_monitor, SIGUSR1) == 0) {
                     monitor_notificat = 1;
                 }
             }
         }
 
+        // Scriem in log rezultatul notificarii.
         char actiune_log[128];
         if (monitor_notificat) {
             snprintf(actiune_log, sizeof(actiune_log), "add (Monitor NOTIFIED)");
-            printf("Report added successfully. Monitor notified!\n");
+            printf("Raport adaugat. Monitorul a fost notificat!\n");
         } else {
             snprintf(actiune_log, sizeof(actiune_log), "add (Monitor COULD NOT BE INFORMED)");
-            printf("Report added successfully. Warning: Monitor could not be informed.\n");
+            printf("Raport adaugat, dar monitorul n-a putut fi anuntat (probabil e oprit).\n");
         }
         scrie_in_log(district, actiune_log);
     }
 }
 
+// Afiseaza toate rapoartele dintr-un fisier binar.
 void lista_rapoarte(const char *district) {
     char cale[256];
     snprintf(cale, sizeof(cale), "%s/reports.dat", district);
 
     struct stat st;
     if (stat(cale, &st) < 0) {
-        printf("Nu s-au gasit rapoarte in districtul %s.\n", district);
+        printf("Niciun raport gasit in %s.\n", district);
         return;
     }
 
     char perms[10];
     permisiuni_in_string(st.st_mode, perms);
-    printf("Fisier: %s | Permisiuni: %s | Dimensiune: %ld bytes\n\n", cale, perms, st.st_size);
+    printf("Fisier: %s | Perms: %s | Size: %ld bytes\n\n", cale, perms, st.st_size);
 
     int fd = open(cale, O_RDONLY);
     if (fd < 0) return;
@@ -188,47 +207,34 @@ void lista_rapoarte(const char *district) {
     scrie_in_log(district, "list");
 }
 
+// Cauta un raport dupa ID si il printeaza frumos.
 void vizualizeaza_raport(const char *district, int id_raport) {
     char cale[256];
     snprintf(cale, sizeof(cale), "%s/reports.dat", district);
 
     int fd = open(cale, O_RDONLY);
-    if (fd < 0) {
-        printf("Nu s-au gasit rapoarte in %s.\n", district);
-        return;
-    }
+    if (fd < 0) return;
 
     Report rap;
     int gasit = 0;
     while (read(fd, &rap, sizeof(Report)) == sizeof(Report)) {
         if (rap.id == id_raport) {
-            printf("\n=== Detalii Raport %d ===\n", rap.id);
-            printf("Inspector:   %s\n", rap.inspector);
-            printf("GPS:         %.6f, %.6f\n", rap.latitude, rap.longitude);
-            printf("Category:    %s\n", rap.category);
-            printf("Severity:    %d\n", rap.severity);
-            
-            char timp_str[64];
-            struct tm *tm_info = localtime(&rap.timestamp);
-            strftime(timp_str, sizeof(timp_str), "%Y-%m-%d %H:%M:%S", tm_info);
-            printf("Data:        %s\n", timp_str);
-            printf("Description: %s\n", rap.description);
-            printf("=========================\n\n");
-            gasit = 1;
-            break;
+            printf("\n--- Detalii %d ---\n", rap.id);
+            printf("User: %s | Cat: %s | Sev: %d\nDesc: %s\n", 
+                    rap.inspector, rap.category, rap.severity, rap.description);
+            gasit = 1; break;
         }
     }
     close(fd);
-
-    if (!gasit) {
-        printf("Raportul cu ID-ul %d nu a fost gasit.\n", id_raport);
-    }
+    if (!gasit) printf("Raportul %d nu exista.\n", id_raport);
     scrie_in_log(district, "view");
 }
 
+// Aici e partea complicata: stergerea dintr-un fisier binar.
+// Metoda: rescriem peste el restul fisierului si apoi ii dam ftruncate.
 void sterge_un_raport(const char *district, int id_raport) {
     if (strcmp(rol_curent, "manager") != 0) {
-        printf("Eroare: Doar managerii au voie sa stearga rapoarte din sistem.\n");
+        printf("Eroare: N-ai voie, boss. Doar managerii.\n");
         return;
     }
 
@@ -242,125 +248,76 @@ void sterge_un_raport(const char *district, int id_raport) {
     off_t pos = 0;
     int gasit = 0;
 
-    // cautam raportul sa vedem unde e
     while (read(fd, &rap, sizeof(Report)) == sizeof(Report)) {
-        if (rap.id == id_raport) {
-            gasit = 1;
-            break;
-        }
+        if (rap.id == id_raport) { gasit = 1; break; }
         pos += sizeof(Report);
     }
 
-    if (!gasit) {
-        printf("Raportul %d nu a fost gasit.\n", id_raport);
-        close(fd);
-        return;
+    if (gasit) {
+        off_t citire_pos = pos + sizeof(Report);
+        off_t scriere_pos = pos;
+        while (1) {
+            lseek(fd, citire_pos, SEEK_SET);
+            if (read(fd, &rap, sizeof(Report)) != sizeof(Report)) break;
+            lseek(fd, scriere_pos, SEEK_SET);
+            write(fd, &rap, sizeof(Report));
+            citire_pos += sizeof(Report);
+            scriere_pos += sizeof(Report);
+        }
+        struct stat st;
+        fstat(fd, &st);
+        ftruncate(fd, st.st_size - sizeof(Report));
+        printf("Sters cu succes.\n");
     }
-
-    // mutam toate rapoartele de dupa el cu o pozitie mai in spate ca sa il suprascriem
-    off_t citire_pos = pos + sizeof(Report);
-    off_t scriere_pos = pos;
-    
-    while (1) {
-        lseek(fd, citire_pos, SEEK_SET);
-        if (read(fd, &rap, sizeof(Report)) != sizeof(Report)) break;
-        
-        lseek(fd, scriere_pos, SEEK_SET);
-        write(fd, &rap, sizeof(Report));
-        
-        citire_pos += sizeof(Report);
-        scriere_pos += sizeof(Report);
-    }
-
-    struct stat st;
-    fstat(fd, &st);
-    ftruncate(fd, st.st_size - sizeof(Report));
     close(fd);
-    
-    printf("Raportul %d a fost sters.\n", id_raport);
     scrie_in_log(district, "remove_report");
 }
 
+// Schimba limita in fisierul cfg.
 void actualizeaza_limita(const char *district, int valoare) {
-    if (strcmp(rol_curent, "manager") != 0) {
-        printf("Eroare: Doar managerii pot schimba limita (threshold).\n");
-        return;
-    }
-
-    pregateste_district(district);
+    if (strcmp(rol_curent, "manager") != 0) return;
     char cale[256];
     snprintf(cale, sizeof(cale), "%s/district.cfg", district);
-
     int fd = open(cale, O_WRONLY | O_CREAT | O_TRUNC, 0640);
     if (fd >= 0) {
         char buf[64];
         int len = snprintf(buf, sizeof(buf), "threshold=%d\n", valoare);
         write(fd, buf, len);
         close(fd);
-        chmod(cale, 0640);
-        printf("Threshold actualizat cu succes la %d.\n", valoare);
         scrie_in_log(district, "update_threshold");
     }
 }
 
-void printeaza_filtre(const char *district, const char *conditie) {
-    char cale_fisier[256];
-    snprintf(cale_fisier, sizeof(cale_fisier), "%s/reports.dat", district);
-    
-    int fd = open(cale_fisier, O_RDONLY);
-    if (fd < 0) {
-        printf("Nu exista date pentru %s.\n", district);
-        return;
-    }
-
-    char camp[32], operator[4], valoare[64];
-    if (!extrage_conditie(conditie, camp, operator, valoare)) {
-        printf("Formatul conditiei e gresit.\n");
-        close(fd);
-        return;
-    }
-
-    Report rap;
-    while (read(fd, &rap, sizeof(Report)) == sizeof(Report)) {
-        if (verifica_raport(&rap, camp, operator, valoare)) {
-            printf("Match -> ID: %d | Cat: %s | Sev: %d\n", rap.id, rap.category, rap.severity);
-        }
-    }
-    close(fd);
-    scrie_in_log(district, "filter");
-}
-
+// LOGICA DE PROCESE (Phase 2):
+// Folosim fork() si exec() ca sa chemam utilitarul rm din Linux.
 void sterge_district_complet(const char *district) {
     if (strcmp(rol_curent, "manager") != 0) {
-        printf("Error: Only managers can remove entire districts.\n");
+        printf("Error: Manager role required.\n");
         return;
     }
 
-    if (strchr(district, '/') != NULL || strcmp(district, ".") == 0 || strcmp(district, "..") == 0) {
-        printf("Error: Invalid district name. Name cannot contain path separators.\n");
+    // Verificare de securitate sa nu primim un nume de folder nasol.
+    if (strchr(district, '/') != NULL) {
+        printf("Error: Nu e voie cu slash-uri.\n");
         return;
     }
 
-    pid_t pid_copil = fork();
-    
-    if (pid_copil < 0) {
-        perror("Eroare la crearea procesului copil (fork)");
-        return;
-    }
-
-    if (pid_copil == 0) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Suntem in copil: executam rm -rf folder
         execlp("rm", "rm", "-rf", district, NULL);
-        perror("Eroare la executia comenzii rm");
         exit(1);
-    } else {
+    } else if (pid > 0) {
+        // Suntem in parinte: asteptam copilul sa termine
         wait(NULL); 
         char nume_link[256];
         snprintf(nume_link, sizeof(nume_link), "active_reports-%s", district);
-        unlink(nume_link);
-        printf("Districtul '%s' si link-ul simbolic au fost sterse.\n", district);
+        unlink(nume_link); // Stergem si link-ul simbolic.
+        printf("District sters prin proces copil (fork+exec).\n");
     }
 }
 
+// Punctul de intrare - parsam argumentele din linia de comanda
 int main(int argc, char *argv[]) {
     char district[128] = "";
     char comanda[32] = "";
@@ -379,28 +336,18 @@ int main(int argc, char *argv[]) {
     }
 
     if (strlen(rol_curent) == 0 || strlen(district) == 0) {
-        printf("Usage: %s --role <inspector|manager> --user <name> --<command> <district> [args]\n", argv[0]);
+        printf("Usage: %s --role <role> --user <name> --<cmd> <dist> [args]\n", argv[0]);
         return 1;
     }
 
-    // AICI erau lipsa comenzile, le-am repus pe toate!
-    if (strcmp(comanda, "add") == 0) {
-        adauga_raport(district);
-    } else if (strcmp(comanda, "list") == 0) {
-        lista_rapoarte(district);
-    } else if (strcmp(comanda, "view") == 0) {
-        vizualizeaza_raport(district, atoi(argument_extra));
-    } else if (strcmp(comanda, "remove_report") == 0) {
-        sterge_un_raport(district, atoi(argument_extra));
-    } else if (strcmp(comanda, "update_threshold") == 0) {
-        actualizeaza_limita(district, atoi(argument_extra));
-    } else if (strcmp(comanda, "filter") == 0) {
-        printeaza_filtre(district, argument_extra);
-    } else if (strcmp(comanda, "remove_district") == 0) {
-        sterge_district_complet(district);
-    } else {
-        printf("Comanda necunoscuta: %s\n", comanda);
-    }
+    // Switch-ul de comenzi:
+    if (strcmp(comanda, "add") == 0) adauga_raport(district);
+    else if (strcmp(comanda, "list") == 0) lista_rapoarte(district);
+    else if (strcmp(comanda, "view") == 0) vizualizeaza_raport(district, atoi(argument_extra));
+    else if (strcmp(comanda, "remove_report") == 0) sterge_un_raport(district, atoi(argument_extra));
+    else if (strcmp(comanda, "update_threshold") == 0) actualizeaza_limita(district, atoi(argument_extra));
+    else if (strcmp(comanda, "remove_district") == 0) sterge_district_complet(district);
+    else printf("Comanda inexistenta.\n");
 
     return 0;
 }
